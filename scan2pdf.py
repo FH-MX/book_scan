@@ -9,10 +9,14 @@ import numpy as np  # 配列計算
 from PIL import Image, ImageOps  # EXIF の回転の適用と PDF の書き出し
 
 DEPTH_MIN = 40.0  # これより浅い谷は、綴じ目の検出の信頼度が低いとみなす
+MAX_SIDE = 5712  # 写真の長辺をこの大きさまで縮小する（24MP 相当。判定の値はこの大きさで調整した）
 
 
-def load(path):  # EXIF の回転を適用して、OpenCV の BGR 配列で返す
+def load(path):  # EXIF の回転を適用し、大きすぎる写真は縮小して、OpenCV の BGR 配列で返す
     img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")  # 回転を反映して RGB にする
+    s = MAX_SIDE / max(img.size)  # 縮小の倍率
+    if s < 1:  # 48MP など、大きい写真なら
+        img = img.resize((round(img.width * s), round(img.height * s)), Image.Resampling.LANCZOS)  # 24MP 相当に縮小する
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)  # OpenCV の並びに直す
 
 
@@ -81,7 +85,7 @@ def skew_angle(gray):  # 行の投影のばらつきが最大になる傾きを�
             v0 = v  # 基準として覚える
         if v > best_v:  # より大きければ更新する
             best_a, best_v = float(a), v  # 角度とばらつきを覚える
-    return best_a if best_v > 1.1 * v0 and abs(best_a) <= 3.0 else 0.0  # 差が小さいときや 3 度を超える異常な値のときは回さない
+    return best_a if best_v > 1.1 * v0 and abs(best_a) <= 2.0 else 0.0  # 差が小さいときや 2 度を超える異常な値のときは回さない
 
 
 def rotate(img, a):  # 画像を a 度回す（空いた所は白で埋める）
@@ -105,7 +109,7 @@ def order_points(pts):  # 4 点を 左上・右上・右下・左下 の順に�
     return np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]], dtype=np.float32)  # 左上・右上・右下・左下
 
 
-def warp_largest(img, mask, f):  # 縮小画像のマスクで一番大きい領域を 4 角形とみなし、長方形に補正して切り出す
+def warp_largest(img, mask, f, rect_only=False):  # 縮小画像のマスクで一番大きい領域を 4 角形とみなし、長方形に補正して切り出す（rect_only なら回転した長方形で近似する）
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))  # 文字などの穴を埋める
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))  # 細い突起を消す
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)  # つながった領域に分ける
@@ -116,7 +120,7 @@ def warp_largest(img, mask, f):  # 縮小画像のマスクで一番大きい領
     cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  # 輪郭を取る
     hull = cv2.convexHull(max(cnts, key=cv2.contourArea))  # 凸包にする
     box = None  # 4 つの角
-    for eps in (0.01, 0.02, 0.03, 0.05):  # 近似の粗さを変えて 4 角形を探す
+    for eps in (() if rect_only else (0.01, 0.02, 0.03, 0.05)):  # 近似の粗さを変えて 4 角形を探す（rect_only なら探さない）
         approx = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)  # 多角形に近似する
         if len(approx) == 4:  # 4 角形になったら
             box = approx.reshape(4, 2).astype(np.float32)  # 角を取り出す
@@ -144,16 +148,33 @@ def crop_page(img):  # 本文のページ：彩度が低く暗すぎない所を
 
 def crop_cover(img):  # 表紙：写真の縁の色相（机など）と違う所を本とみなして切り出す
     f = 0.25  # 検出は縮小した画像で行う
-    hsv = cv2.cvtColor(cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV).astype(np.int16)  # 縮小して色相・彩度・明度にする
-    b = max(2, int(min(hsv.shape[:2]) * 0.02))  # 縁として使う幅
-    border = np.concatenate([hsv[:b].reshape(-1, 3), hsv[-b:].reshape(-1, 3), hsv[:, :b].reshape(-1, 3), hsv[:, -b:].reshape(-1, 3)])  # 上下左右の縁の画素
-    ref_h = int(np.median(border[:, 0]))  # 背景の代表の色相（0〜179）
-    dh = np.abs(hsv[:, :, 0] - ref_h)  # 色相の差
-    dh = np.minimum(dh, 180 - dh)  # 色相は一周するので、近い方の差にする
-    colored = (dh > 12) & (hsv[:, :, 1] > 60)  # 背景と色相が違い、色のある所
-    whitish = (hsv[:, :, 1] < 50) & (hsv[:, :, 2] > 120)  # 白っぽい所（帯やラベル）
-    mask = (colored | whitish).astype(np.uint8) * 255  # どちらかなら本とみなす
-    return warp_largest(img, mask, f)  # 一番大きい本の領域を切り出す
+    small = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)  # 縮小する
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (9, 9), 0), cv2.COLOR_BGR2LAB).astype(np.float32)  # ぼかして木目を消し、色差を測りやすい色空間にする
+    b = max(2, int(min(lab.shape[:2]) * 0.02))  # 縁として使う幅
+    border = np.concatenate([lab[:b].reshape(-1, 3), lab[-b:].reshape(-1, 3), lab[:, :b].reshape(-1, 3), lab[:, -b:].reshape(-1, 3)])  # 上下左右の縁の画素
+    dist = np.linalg.norm(lab - np.median(border, axis=0), axis=2)  # 背景の代表色からの色の距離
+    d8 = np.clip(dist * 2, 0, 255).astype(np.uint8)  # 0〜255 にする
+    t, mask = cv2.threshold(d8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  # 大津の方法で、背景と本を分けるしきい値を自動で決める
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((25, 25), np.uint8))  # 本につながった机の細い反射を切り離す
+    out = warp_largest(img, mask, f, rect_only=True)  # 一番大きい本の領域を、回転した長方形として切り出す（角が丸い表紙で 4 角形の近似がずれたため）
+    o_small = cv2.resize(out, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)  # 切り出した画像も縮小して測る
+    o_lab = cv2.cvtColor(cv2.GaussianBlur(o_small, (9, 9), 0), cv2.COLOR_BGR2LAB).astype(np.float32)  # 同じように色差を測れる形にする
+    o_d8 = np.clip(np.linalg.norm(o_lab - np.median(border, axis=0), axis=2) * 2, 0, 255).astype(np.uint8)  # 机の色からの距離
+    dark = cv2.erode(o_small, np.ones((5, 5), np.uint8)).max(axis=2) < 40  # 台形補正で端にできた黒い部分（ぼかしで混ざる境目も含める）
+    bg = (o_d8 < t) | dark  # 背景（机か黒）とみなせる画素（縮小した大きさ）
+    h, w = bg.shape  # 縮小後の高さと幅
+
+    def inner(r, n):  # 端から見て、本の列（背景が 3 割未満）が 3 つ続いて始まる位置を返す
+        for i in range(n // 4):  # 端から 4 分の 1 まで
+            if (r[i:i + 3] < 0.3).all():  # 本の列が 3 つ続いたら（1 割にすると表紙の中まで削れた）
+                return i  # そこから本
+        return 0  # 見つからなければ削らない
+
+    cols = bg.mean(axis=0)  # 列ごとの背景の割合
+    x0, x1 = inner(cols, w), w - inner(cols[::-1], w)  # 左右から本の始まりを探す
+    rows = bg[:, x0:x1].mean(axis=1)  # 残した列の範囲で、行ごとの背景の割合
+    y0, y1 = inner(rows, h), h - inner(rows[::-1], h)  # 上下から本の始まりを探す
+    return out[int(y0 / f):int(y1 / f), int(x0 / f):int(x1 / f)]  # 元の大きさに直して、端に残った机を削って返す
 
 
 def best_shift(a, b, win):  # 帯 a に対して、帯 b の行が何 px 下にずれているかを、相関が最大になるずれで求める
@@ -183,7 +204,7 @@ def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り
         return img  # 直さない
     pitch = first_min + int(np.argmax(ac[first_min:lim]))  # 谷の後の一番高い山＝行の間隔
     win = max(2, int(pitch * 0.4))  # 隣の帯どうしで探すずれの範囲（1 行分ずれて誤らないよう、間隔の 4 割まで）
-    nx, ny = 24, 4  # 横に 24、縦に 4 つの区画に分ける
+    nx, ny = 24, 6  # 横に 24、縦に 6 つの区画に分ける
     xs = np.linspace(0, w, nx + 1).astype(int)  # 区画の横の境目
     ys = np.linspace(0, h, ny + 1).astype(int)  # 区画の縦の境目
     D = np.zeros((ny, nx))  # 区画ごとのずれ（中央の帯が基準）
@@ -196,20 +217,47 @@ def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り
             while 0 <= i + step < nx:  # 端まで
                 D[j, i + step] = D[j, i] + best_shift(prof[i], prof[i + step], win)  # 隣とのずれを足していく
                 i += step  # 次の帯へ
-    cx = (xs[:-1] + xs[1:]) / 2.0  # 帯の中心の x
-    for j in range(ny):  # 縦の区画ごとに
-        D[j] = np.polyval(np.polyfit(cx, D[j], 2), cx)  # 2 次式でならして、ばらつきを抑える
+    cx = (xs[:-1] + xs[1:]) / 2.0 / w  # 区画の中心の x（0〜1）
+    cy = (ys[:-1] + ys[1:]) / 2.0 / h  # 区画の中心の y（0〜1）
+    gx, gy = np.meshgrid(cx, cy)  # 区画ごとの中心の座標
+    A = np.stack([(gx ** i * gy ** k).ravel() for i in range(3) for k in range(3)], axis=1)  # x と y の 2 次までの項（3 次にすると端でずれが大きくなりすぎた）
+    coef = np.linalg.lstsq(A, D.ravel(), rcond=None)[0]  # ずれをなめらかな曲面で当てはめる
+    D = (A @ coef).reshape(ny, nx)  # 当てはめた曲面の値に置き換えて、区画ごとのばらつきを抑える
     print(f"  行の曲がり：行間隔 {pitch / f:.0f}px、最大のずれ {np.abs(D).max() / f:.0f}px")  # 確認用に補正量を表示する
     if np.abs(D).max() < 1.0:  # ずれが小さければ（縮小後で 1px 未満）
         return img  # 直さない
     H, W = img.shape[:2]  # 元の高さと幅
     off = cv2.resize((D / f).astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)  # 元の大きさでのずれ
     map_x, map_y = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))  # 元の座標
-    return cv2.remap(img, map_x, map_y + off, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)  # 縦にずらして返す
+    return cv2.remap(img, map_x, map_y + off, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))  # 縦にずらして返す（はみ出した所は白）
+
+
+def trim_wood(img, s_min=60):  # 切り出した後の端に残った机（オレンジ系の色）の列と行を、外側から削る
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # 元の色で判定する（明るさを整えると、机の広い所まで白くなって見分けられない）
+    wood = (hsv[:, :, 0] >= 5) & (hsv[:, :, 0] <= 30) & (hsv[:, :, 1] > s_min) & (hsv[:, :, 2] > 80)  # 机の色の画素（蛍光ペンは列全体の 15% には届かない）
+    wood |= hsv[:, :, 2] < 50  # 台形補正ではみ出した黒い部分も背景として数える
+    h, w = wood.shape  # 高さと幅
+    cols = wood.mean(axis=0)  # 列ごとの机の色の割合
+    x0, x1 = 0, w  # 残す列の範囲
+    while x0 < w // 3 and cols[x0] > 0.15:  # 左端から、机の色が多い列を削る（削りすぎない上限つき）
+        x0 += 1  # 1 列進める
+    while x1 > w * 2 // 3 and cols[x1 - 1] > 0.15:  # 右端から
+        x1 -= 1  # 1 列戻す
+    rows = wood[:, x0:x1].mean(axis=1)  # 残した列の範囲だけで、行ごとの机の色の割合を測る
+    y0, y1 = 0, h  # 残す行の範囲
+    while y0 < h // 3 and rows[y0] > 0.5:  # 上端から、背景が半分以上の行だけを削る（本文の行を削らないよう厳しめ）
+        y0 += 1  # 1 行進める
+    while y1 > h * 2 // 3 and rows[y1 - 1] > 0.5:  # 下端から
+        y1 -= 1  # 1 行戻す
+    return img[y0:y1, x0:x1]  # 残す範囲だけを返す
 
 
 def prepare_text_page(img, max_h):  # 本文のページを整える（紙を切り出し、行の曲がりを戻し、明るさのむらを消し、傾きを直し、縮小する）
-    flat = flatten_light(dewarp_by_lines(crop_page(img)))  # 紙を切り出し、行の曲がりを戻してから、明るさのむらを消す
+    cropped = trim_wood(crop_page(img))  # 紙を切り出し、端に残った机を削る
+    dewarped = dewarp_by_lines(cropped)  # 行の曲がりを戻す
+    flat = flatten_light(dewarped)  # 明るさのむらを消す
+    if dewarped is not cropped:  # 湾曲補正をかけたページは、傾きもそこで直っている
+        return shrink(flat, max_h), 0.0  # 傾きの推定は湾曲に引っぱられて当てにならないので、回さない
     ang = skew_angle(cv2.cvtColor(flat, cv2.COLOR_BGR2GRAY))  # 傾きを求める
     return shrink(rotate(flat, ang), max_h), ang  # 傾きを直して縮小し、角度も返す
 
