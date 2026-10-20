@@ -1,0 +1,16 @@
+# 既定ではすべて除外する。公開するものだけ許可する。
+*
+!*/
+!.gitignore
+!README.md
+!LICENSE
+!requirements.txt
+!*.py
+!*.sh
+
+# 許可した拡張子でも、これらの中身は公開しない
+.venv/
+__pycache__/
+data/
+input/
+output/
