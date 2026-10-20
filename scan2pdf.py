@@ -189,6 +189,19 @@ def best_shift(a, b, win):  # 帯 a に対して、帯 b の行が何 px 下に�
     return best_d if best / norm >= 0.3 else 0  # 相関が弱いときは信用しない
 
 
+def find_pitch(ac, h):  # 行の間隔（縮小後の px）を、自己相関から求める。決められなければ None
+    lo, hi = max(3, int(h / 70)), min(int(h / 25), len(ac) // 4)  # 1 ページに 25〜70 行ある、という前提の範囲
+    if hi - lo < 3:  # 範囲が狭すぎれば
+        return None  # 決められない
+    top = ac[lo:hi].max()  # 範囲内で一番高い山
+    if top <= 0:  # 山がなければ
+        return None  # 決められない
+    for i in range(lo + 1, hi - 1):  # 範囲内を、小さいほうから順に見て
+        if ac[i] >= ac[i - 1] and ac[i] > ac[i + 1] and ac[i] >= 0.5 * top:  # 山で、一番高い山の半分以上なら
+            return i  # 最初に見つかった山を行間隔とする（2 倍、3 倍の山を拾わないため）
+    return None  # 見つからなければ決められない
+
+
 def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り、行がまっすぐ並ぶように縦へずらす
     f = 0.25  # 測定は縮小した画像で行う
     gray = cv2.cvtColor(cv2.resize(flatten_light(img), None, fx=f, fy=f, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY).astype(np.float32)  # むらを消して縮小した灰色
@@ -198,11 +211,9 @@ def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り
     ac = np.correlate(ref, ref, mode="full")[len(ref) - 1:]  # 自己相関（行の繰り返しの間隔を見るため）
     if len(ac) < 60:  # 画像が小さすぎれば
         return img  # 直さない
-    lim = len(ac) // 4  # 探す範囲の上限
-    first_min = next((i for i in range(1, lim - 1) if ac[i] < ac[i - 1] and ac[i] <= ac[i + 1]), None)  # 自己相関の最初の谷
-    if first_min is None:  # 谷がなければ（行の繰り返しがない）
+    pitch = find_pitch(ac, h)  # 行の間隔を求める
+    if pitch is None:  # 決められなければ（行の繰り返しがない）
         return img  # 直さない
-    pitch = first_min + int(np.argmax(ac[first_min:lim]))  # 谷の後の一番高い山＝行の間隔
     win = max(2, int(pitch * 0.4))  # 隣の帯どうしで探すずれの範囲（1 行分ずれて誤らないよう、間隔の 4 割まで）
     nx, ny = 24, 6  # 横に 24、縦に 6 つの区画に分ける
     xs = np.linspace(0, w, nx + 1).astype(int)  # 区画の横の境目
