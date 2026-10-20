@@ -274,10 +274,24 @@ def decide_cut(img, name, cuts):  # 見開きの切り位置を決めて、説�
     return x, f"警告：谷が浅く（{depth:.1f}）文字のない帯も見つからない。--cut で指定を"  # 仕方なく谷の位置を使う
 
 
+def natural_key(p):  # IMG_0999 の次に IMG_1000 が来るように、数字は数として並べる
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", p.name)]  # 文字と数字を交互に分けて比べる
+
+
+def collect(inputs):  # ファイルならそのまま、フォルダなら中の JPEG を名前順に集める
+    files = []  # 集めた写真
+    for p in map(Path, inputs):  # 渡されたものを順に
+        if p.is_dir():  # フォルダなら
+            files += sorted((f for f in p.iterdir() if f.suffix.lower() in (".jpg", ".jpeg") and not f.name.startswith(".")), key=natural_key)  # 隠しファイルを除いて、名前順に
+        else:  # ファイルなら
+            files.append(p)  # そのまま
+    return files  # 撮影順の写真の一覧
+
+
 def main():  # 全体の処理
     ap = argparse.ArgumentParser()  # 引数の定義
-    ap.add_argument("inputs", nargs="+", help="写真のファイル（撮影順）")  # 入力の写真
-    ap.add_argument("-o", "--output", required=True, help="出力する PDF")  # 出力の PDF
+    ap.add_argument("inputs", nargs="+", help="写真のファイル、または写真の入ったフォルダ（フォルダなら中の JPEG を名前順に処理する）")  # 入力の写真
+    ap.add_argument("-o", "--output", help="出力する PDF（フォルダを 1 つだけ渡したときは省略でき、フォルダの隣に <フォルダ名>.pdf を作る）")  # 出力の PDF
     ap.add_argument("--rtl", action="store_true", help="右開き（縦書きの本）。右のページが先")  # 綴じ方向
     ap.add_argument("--max-height", type=int, default=2600, help="ページ画像の高さの上限（px）")  # 縮小の上限
     ap.add_argument("--quality", type=int, default=80, help="JPEG の品質")  # 画質
@@ -285,9 +299,20 @@ def main():  # 全体の処理
     ap.add_argument("--cut", action="append", default=[], help="綴じ目を手で指定する（例：IMG_0774.JPG=2750）")  # 手動の切り位置
     ap.add_argument("--no-ocr", action="store_true", help="OCR をしない")  # OCR を省く
     args = ap.parse_args()  # 引数を読む
+    files = collect(args.inputs)  # 写真の一覧を作る
+    if not files:  # 写真が 1 枚もなければ
+        ap.error("JPEG の写真が見つかりません")  # エラーにする
+    if args.output:  # 出力先が指定されていれば
+        out = Path(args.output)  # それを使う
+    elif len(args.inputs) == 1 and Path(args.inputs[0]).is_dir():  # フォルダを 1 つだけ渡したなら
+        d = Path(args.inputs[0]).resolve()  # フォルダの本当の場所（. でも名前が分かるように）
+        out = d.parent / f"{d.name}.pdf"  # フォルダの隣に <フォルダ名>.pdf を作る
+    else:  # それ以外で出力先がなければ
+        ap.error("-o で出力の PDF を指定してください")  # エラーにする
+    print(f"写真 {len(files)} 枚 → {out}")  # 何を作るかを表示する
     cuts = dict(c.split("=") for c in args.cut)  # 手動の切り位置を辞書にする
     pages = []  # 出力するページを順に入れる
-    for path in map(Path, args.inputs):  # 写真を 1 枚ずつ処理する
+    for path in files:  # 写真を 1 枚ずつ処理する
         img = load(path)  # 写真を読む
         h, w = img.shape[:2]  # 回転を反映した後の高さと幅
         if h >= w:  # 縦長なら、表紙などの単ページ
@@ -304,7 +329,6 @@ def main():  # 全体の処理
             pages.append(page)  # ページに加える
             angs.append(ang)  # 傾きを覚える
         print(f"{path.name}: 見開き 切り位置 {x}px（{how}）傾き {angs[0]} / {angs[1]} 度")  # 結果を表示する
-    out = Path(args.output)  # 出力先
     tmp = out.with_suffix(".noocr.pdf")  # OCR の前の PDF
     images = [Image.fromarray(cv2.cvtColor(p, cv2.COLOR_BGR2RGB)) for p in pages]  # PIL の画像にする
     images[0].save(tmp, "PDF", save_all=True, append_images=images[1:], resolution=args.dpi, quality=args.quality)  # PDF に書き出す

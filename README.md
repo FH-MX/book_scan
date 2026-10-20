@@ -37,11 +37,30 @@ python3 -m venv .venv
 
 ## 使い方
 
+写真の入ったフォルダを渡すと、中の JPEG を名前順に処理して PDF にする。
+
 ```bash
-.venv/bin/python scan2pdf.py 写真のフォルダ/*.JPG -o 本の名前.pdf
+.venv/bin/python scan2pdf.py 写真のフォルダ
 ```
 
-- 写真は撮影順（ファイル名順）に渡す
+- 出力は、フォルダの隣の `<フォルダ名>.pdf` と `<フォルダ名>.txt`。`-o` で場所と名前を変えられる
+- 写真のファイルを撮影順に並べて渡し、`-o` で出力を指定することもできる
+
+```bash
+.venv/bin/python scan2pdf.py 写真1.JPG 写真2.JPG ... -o 本の名前.pdf
+```
+
+### どこからでも `scan2pdf` で呼ぶ
+`scan2pdf.sh` を PATH の通ったフォルダにリンクする（`~/.local/bin` が PATH に入っている場合）。
+
+```bash
+chmod +x scan2pdf.sh
+ln -s "$(pwd)/scan2pdf.sh" ~/.local/bin/scan2pdf
+scan2pdf 写真のフォルダ
+```
+
+- フォルダ内の写真は、数字を数として並べる（IMG_0999 の次に IMG_1000）
+- 写真は JPEG のみ。HEIC は未対応
 - 出力：`本の名前.pdf`（文字検索つき）、`本の名前.txt`（AI 用。日本語の文字の間の空白を除いたもの）、`本の名前.noocr.pdf`（OCR 前）
 
 | オプション | 意味 |
