@@ -11,7 +11,7 @@ from PIL import Image, ImageOps  # EXIF の回転の適用と PDF の書き出�
 
 DEPTH_MIN = 40.0  # これより浅い谷は、綴じ目の検出の信頼度が低いとみなす
 MAX_SIDE = 5712  # 写真の長辺をこの大きさまで縮小する（24MP 相当。判定の値はこの大きさで調整した）
-INFO = {"pitch": "", "shift": ""}  # 直近のページの湾曲補正の測り値（レポート用。測れなければ空）
+INFO = {"pitch": "", "shift": "", "bg": "", "ref": None}  # 直近のページの測り値（レポート用。測れなければ空）。ref は写真の縁の色（背景の代表色）
 
 
 def load(path):  # EXIF の回転を適用し、大きすぎる写真は縮小して、OpenCV の BGR 配列で返す
@@ -273,9 +273,27 @@ def wood_ratio(img):  # 出力ページに残った机の色（オレンジ系�
     return round(float(wood.mean()) * 100, 1)  # 割合（%）
 
 
+def border_ref(img):  # 写真の縁（上下左右の細い帯）の色の中央値を、Lab で返す。背景（机など）の代表色として使う
+    f = 0.25  # 縮小して測る
+    small = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)  # 縮小する
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (9, 9), 0), cv2.COLOR_BGR2LAB).astype(np.float32)  # ぼかして木目を消し、色差を測る色空間にする
+    b = max(2, int(min(lab.shape[:2]) * 0.02))  # 縁として使う幅
+    border = np.concatenate([lab[:b].reshape(-1, 3), lab[-b:].reshape(-1, 3), lab[:, :b].reshape(-1, 3), lab[:, -b:].reshape(-1, 3)])  # 上下左右の縁の画素
+    return np.median(border, axis=0)  # 中央値
+
+
+def bg_ratio(img, ref):  # 画像のうち、背景の代表色に近い画素の割合（%）。机の色や明るさに依存しない、切り出しの良し悪しの指標
+    if ref is None:  # 代表色がなければ
+        return ""  # 測れない
+    small = cv2.resize(img, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)  # 縮小する
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (9, 9), 0), cv2.COLOR_BGR2LAB).astype(np.float32)  # ぼかして Lab にする
+    return round(float((np.linalg.norm(lab - ref, axis=2) < 30).mean()) * 100, 1)  # 色の距離が 30 未満の割合
+
+
 def prepare_text_page(img, max_h):  # 本文のページを整える（紙を切り出し、行の曲がりを戻し、明るさのむらを消し、傾きを直し、縮小する）
-    INFO["pitch"], INFO["shift"] = "", ""  # このページの測り値を空にしておく（測れなければ空欄のままレポートに出る）
+    INFO["pitch"], INFO["shift"], INFO["bg"] = "", "", ""  # このページの測り値を空にしておく（測れなければ空欄のままレポートに出る）
     cropped = trim_wood(crop_page(img))  # 紙を切り出し、端に残った机を削る
+    INFO["bg"] = bg_ratio(cropped, INFO["ref"])  # 切り出した直後（明るさを整える前）の背景の残り
     dewarped = dewarp_by_lines(cropped)  # 行の曲がりを戻す
     flat = flatten_light(dewarped)  # 明るさのむらを消す
     if dewarped is not cropped:  # 湾曲補正をかけたページは、傾きもそこで直っている
@@ -338,11 +356,12 @@ def main():  # 全体の処理
     report = []  # レポートの行を順に入れる（数字だけ。画像は含まない）
     for path in files:  # 写真を 1 枚ずつ処理する
         img = load(path)  # 写真を読む
+        INFO["ref"] = border_ref(img)  # 写真の縁の色（背景の代表色）を覚える
         h, w = img.shape[:2]  # 回転を反映した後の高さと幅
         if h >= w:  # 縦長なら、表紙などの単ページ
             page = shrink(crop_cover(img), args.max_height)  # 本の部分を切り出して、色のまま縮小する
             pages.append(page)  # ページに加える
-            report.append([path.name, "単ページ", "", "", "", "", "", "", wood_ratio(page), page.shape[1], page.shape[0]])  # レポートの行
+            report.append([path.name, "単ページ", "", "", "", "", "", "", wood_ratio(page), bg_ratio(page, INFO["ref"]), page.shape[1], page.shape[0]])  # レポートの行
             print(f"{path.name}: 単ページ（縦長）")  # 判定を表示する
             continue  # 次の写真へ
         x, how, kind, depth = decide_cut(img, path.name, cuts)  # 切り位置を決める
@@ -354,12 +373,12 @@ def main():  # 全体の処理
             page, ang = prepare_text_page(half, args.max_height)  # 整える
             pages.append(page)  # ページに加える
             angs.append(ang)  # 傾きを覚える
-            report.append([path.name, f"見開き（{side}）", x, kind, depth, INFO["pitch"], INFO["shift"], ang, wood_ratio(page), page.shape[1], page.shape[0]])  # レポートの行
+            report.append([path.name, f"見開き（{side}）", x, kind, depth, INFO["pitch"], INFO["shift"], ang, wood_ratio(page), INFO["bg"], page.shape[1], page.shape[0]])  # レポートの行
         print(f"{path.name}: 見開き 切り位置 {x}px（{how}）傾き {angs[0]} / {angs[1]} 度")  # 結果を表示する
     rep = out.with_name(f"{out.stem}_report.csv")  # 数字だけのレポート（ドットが 2 つ続かないよう _ でつなぐ）
     with open(rep, "w", newline="", encoding="utf-8-sig") as f:  # Excel などでも開けるよう BOM つきで書く
         wr = csv.writer(f)  # CSV の書き手
-        wr.writerow(["写真", "種別", "切り位置px", "切り方", "谷の深さ", "行間隔px", "補正の最大ずれpx", "傾き度", "木目の割合%", "出力の幅", "出力の高さ"])  # 見出し
+        wr.writerow(["写真", "種別", "切り位置px", "切り方", "谷の深さ", "行間隔px", "補正の最大ずれpx", "傾き度", "木目の割合%", "背景の残り%", "出力の幅", "出力の高さ"])  # 見出し
         wr.writerows(report)  # 本体
     spreads = [r for r in report if r[1].startswith("見開き")]  # 見開きのページ
     print(f"レポート: {rep}（湾曲補正をしなかったページ {sum(1 for r in spreads if r[5] == '')}/{len(spreads)}、警告 {sum(1 for r in report if r[3] == '警告')}）")  # 要約
