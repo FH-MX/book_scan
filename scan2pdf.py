@@ -1,5 +1,6 @@
 # scan2pdf.py — 本の写真（JPEG）をページごとに整形して、文字検索できる PDF にする（試作 v0.4）
 import argparse  # コマンドの引数を読むため
+import csv  # 数字だけのレポート（CSV）を書くため
 import re  # テキストの空白を整えるため
 import subprocess  # ocrmypdf を呼び出すため
 from pathlib import Path  # パスを扱うため
@@ -10,6 +11,7 @@ from PIL import Image, ImageOps  # EXIF の回転の適用と PDF の書き出�
 
 DEPTH_MIN = 40.0  # これより浅い谷は、綴じ目の検出の信頼度が低いとみなす
 MAX_SIDE = 5712  # 写真の長辺をこの大きさまで縮小する（24MP 相当。判定の値はこの大きさで調整した）
+INFO = {"pitch": "", "shift": ""}  # 直近のページの湾曲補正の測り値（レポート用。測れなければ空）
 
 
 def load(path):  # EXIF の回転を適用し、大きすぎる写真は縮小して、OpenCV の BGR 配列で返す
@@ -214,6 +216,7 @@ def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り
     pitch = find_pitch(ac, h)  # 行の間隔を求める
     if pitch is None:  # 決められなければ（行の繰り返しがない）
         return img  # 直さない
+    INFO["pitch"] = round(pitch / f)  # レポート用：行間隔（元の大きさでの px）
     win = max(2, int(pitch * 0.4))  # 隣の帯どうしで探すずれの範囲（1 行分ずれて誤らないよう、間隔の 4 割まで）
     nx, ny = 24, 6  # 横に 24、縦に 6 つの区画に分ける
     xs = np.linspace(0, w, nx + 1).astype(int)  # 区画の横の境目
@@ -234,6 +237,7 @@ def dewarp_by_lines(img):  # 文字の行の上下のずれを列ごとに測り
     A = np.stack([(gx ** i * gy ** k).ravel() for i in range(3) for k in range(3)], axis=1)  # x と y の 2 次までの項（3 次にすると端でずれが大きくなりすぎた）
     coef = np.linalg.lstsq(A, D.ravel(), rcond=None)[0]  # ずれをなめらかな曲面で当てはめる
     D = (A @ coef).reshape(ny, nx)  # 当てはめた曲面の値に置き換えて、区画ごとのばらつきを抑える
+    INFO["shift"] = round(float(np.abs(D).max()) / f)  # レポート用：補正の最大のずれ（元の大きさでの px）
     print(f"  行の曲がり：行間隔 {pitch / f:.0f}px、最大のずれ {np.abs(D).max() / f:.0f}px")  # 確認用に補正量を表示する
     if np.abs(D).max() < 1.0:  # ずれが小さければ（縮小後で 1px 未満）
         return img  # 直さない
@@ -263,7 +267,14 @@ def trim_wood(img, s_min=60):  # 切り出した後の端に残った机（オ�
     return img[y0:y1, x0:x1]  # 残す範囲だけを返す
 
 
+def wood_ratio(img):  # 出力ページに残った机の色（オレンジ系で彩度が高い）の割合（%）
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # 色相・彩度・明度にする
+    wood = (hsv[:, :, 0] >= 5) & (hsv[:, :, 0] <= 25) & (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 80)  # 机の色の画素
+    return round(float(wood.mean()) * 100, 1)  # 割合（%）
+
+
 def prepare_text_page(img, max_h):  # 本文のページを整える（紙を切り出し、行の曲がりを戻し、明るさのむらを消し、傾きを直し、縮小する）
+    INFO["pitch"], INFO["shift"] = "", ""  # このページの測り値を空にしておく（測れなければ空欄のままレポートに出る）
     cropped = trim_wood(crop_page(img))  # 紙を切り出し、端に残った机を削る
     dewarped = dewarp_by_lines(cropped)  # 行の曲がりを戻す
     flat = flatten_light(dewarped)  # 明るさのむらを消す
@@ -273,16 +284,17 @@ def prepare_text_page(img, max_h):  # 本文のページを整える（紙を切
     return shrink(rotate(flat, ang), max_h), ang  # 傾きを直して縮小し、角度も返す
 
 
-def decide_cut(img, name, cuts):  # 見開きの切り位置を決めて、説明と一緒に返す
+def decide_cut(img, name, cuts):  # 見開きの切り位置を決めて、（位置、説明、種別、谷の深さ）を返す
     if name in cuts:  # 手動の指定があれば
-        return int(cuts[name]), "手動の指定"  # それを使う
+        return int(cuts[name]), "手動の指定", "手動", ""  # それを使う
     x, depth = find_spine(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))  # 綴じ目の谷を探す
+    d = round(float(depth), 1)  # レポート用に丸めた谷の深さ
     if depth >= DEPTH_MIN:  # 谷が十分に深ければ
-        return x, f"綴じ目の谷（深さ {depth:.1f}）"  # それを使う
+        return x, f"綴じ目の谷（深さ {depth:.1f}）", "谷", d  # それを使う
     gx, glen = find_gap(img)  # 谷が浅いので、文字のない帯を探す
     if gx is not None and glen >= 60:  # 十分な幅の帯があれば
-        return gx, f"谷が浅い（{depth:.1f}）ので文字のない帯の中央（幅 {glen}px）"  # それを使う
-    return x, f"警告：谷が浅く（{depth:.1f}）文字のない帯も見つからない。--cut で指定を"  # 仕方なく谷の位置を使う
+        return gx, f"谷が浅い（{depth:.1f}）ので文字のない帯の中央（幅 {glen}px）", "帯", d  # それを使う
+    return x, f"警告：谷が浅く（{depth:.1f}）文字のない帯も見つからない。--cut で指定を", "警告", d  # 仕方なく谷の位置を使う
 
 
 def natural_key(p):  # IMG_0999 の次に IMG_1000 が来るように、数字は数として並べる
@@ -323,30 +335,41 @@ def main():  # 全体の処理
     print(f"写真 {len(files)} 枚 → {out}")  # 何を作るかを表示する
     cuts = dict(c.split("=") for c in args.cut)  # 手動の切り位置を辞書にする
     pages = []  # 出力するページを順に入れる
+    report = []  # レポートの行を順に入れる（数字だけ。画像は含まない）
     for path in files:  # 写真を 1 枚ずつ処理する
         img = load(path)  # 写真を読む
         h, w = img.shape[:2]  # 回転を反映した後の高さと幅
         if h >= w:  # 縦長なら、表紙などの単ページ
-            pages.append(shrink(crop_cover(img), args.max_height))  # 本の部分を切り出して、色のまま縮小する
+            page = shrink(crop_cover(img), args.max_height)  # 本の部分を切り出して、色のまま縮小する
+            pages.append(page)  # ページに加える
+            report.append([path.name, "単ページ", "", "", "", "", "", "", wood_ratio(page), page.shape[1], page.shape[0]])  # レポートの行
             print(f"{path.name}: 単ページ（縦長）")  # 判定を表示する
             continue  # 次の写真へ
-        x, how = decide_cut(img, path.name, cuts)  # 切り位置を決める
-        halves = [img[:, :x], img[:, x:]]  # 左右に割る
+        x, how, kind, depth = decide_cut(img, path.name, cuts)  # 切り位置を決める
+        halves = [("左", img[:, :x]), ("右", img[:, x:])]  # 左右に割る
         if args.rtl:  # 右開きなら
             halves.reverse()  # 右のページを先にする
         angs = []  # 左右の傾き
-        for half in halves:  # 左右のページを順に整える
+        for side, half in halves:  # 左右のページを順に整える
             page, ang = prepare_text_page(half, args.max_height)  # 整える
             pages.append(page)  # ページに加える
             angs.append(ang)  # 傾きを覚える
+            report.append([path.name, f"見開き（{side}）", x, kind, depth, INFO["pitch"], INFO["shift"], ang, wood_ratio(page), page.shape[1], page.shape[0]])  # レポートの行
         print(f"{path.name}: 見開き 切り位置 {x}px（{how}）傾き {angs[0]} / {angs[1]} 度")  # 結果を表示する
-    tmp = out.with_suffix(".noocr.pdf")  # OCR の前の PDF
+    rep = out.with_name(f"{out.stem}_report.csv")  # 数字だけのレポート（ドットが 2 つ続かないよう _ でつなぐ）
+    with open(rep, "w", newline="", encoding="utf-8-sig") as f:  # Excel などでも開けるよう BOM つきで書く
+        wr = csv.writer(f)  # CSV の書き手
+        wr.writerow(["写真", "種別", "切り位置px", "切り方", "谷の深さ", "行間隔px", "補正の最大ずれpx", "傾き度", "木目の割合%", "出力の幅", "出力の高さ"])  # 見出し
+        wr.writerows(report)  # 本体
+    spreads = [r for r in report if r[1].startswith("見開き")]  # 見開きのページ
+    print(f"レポート: {rep}（湾曲補正をしなかったページ {sum(1 for r in spreads if r[5] == '')}/{len(spreads)}、警告 {sum(1 for r in report if r[3] == '警告')}）")  # 要約
+    tmp = out.with_name(f"{out.stem}_noocr.pdf")  # OCR の前の PDF
     images = [Image.fromarray(cv2.cvtColor(p, cv2.COLOR_BGR2RGB)) for p in pages]  # PIL の画像にする
     images[0].save(tmp, "PDF", save_all=True, append_images=images[1:], resolution=args.dpi, quality=args.quality)  # PDF に書き出す
     print(f"ページ数 {len(pages)}、OCR 前の PDF: {tmp}")  # 進み具合を表示する
     if args.no_ocr:  # OCR を省くなら
         return  # ここで終わる
-    side = out.with_suffix(".raw.txt")  # OCR の生のテキスト
+    side = out.with_name(f"{out.stem}_raw.txt")  # OCR の生のテキスト（一時ファイル）
     subprocess.run(["ocrmypdf", "-l", "jpn", "--output-type", "pdf", "--optimize", "1", "--sidecar", str(side), str(tmp), str(out)], check=True)  # OCR をかけ、テキストも書き出す
     text = side.read_text(encoding="utf-8")  # 生のテキストを読む
     jp = r"[　-ヿ一-鿿＀-￯]"  # 日本語の文字（記号・かな・漢字・全角）
